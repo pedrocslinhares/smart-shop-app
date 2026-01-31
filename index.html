@@ -38,21 +38,19 @@
             padding-bottom: calc(env(safe-area-inset-bottom) + 80px);
         }
 
-        /* Animações */
+        /* Animações Ajustadas para evitar Tela Branca */
         @keyframes slideUp {
             from {
                 transform: translateY(100%);
-                opacity: 0;
             }
 
             to {
                 transform: translateY(0);
-                opacity: 1;
             }
         }
 
         .animate-slide-up {
-            animation: slideUp 0.3s ease-out forwards;
+            animation: slideUp 0.25s ease-out forwards;
         }
 
         @keyframes fadeIn {
@@ -329,7 +327,7 @@
         };
 
         const InputSelectionModal = ({ onSelect, onClose }) => (
-            <div className="fixed inset-0 z-50 bg-black/60 flex items-end justify-center animate-fade-in" onClick={onClose}>
+            <div className="fixed inset-0 z-[60] bg-black/60 flex items-end justify-center animate-fade-in" onClick={onClose}>
                 <div className="bg-white w-full max-w-md rounded-t-2xl p-6 animate-slide-up space-y-4" onClick={e => e.stopPropagation()}>
                     <div className="w-12 h-1.5 bg-gray-300 rounded-full mx-auto mb-2"></div>
                     <h3 className="text-lg font-bold text-center text-gray-800">Modo de Registro</h3>
@@ -342,7 +340,7 @@
         );
 
         const HistoryDetailModal = ({ log, onClose }) => (
-            <div className="fixed inset-0 z-[60] bg-black/70 flex items-center justify-center p-4 animate-fade-in" onClick={onClose}>
+            <div className="fixed inset-0 z-[70] bg-black/70 flex items-center justify-center p-4 animate-fade-in" onClick={onClose}>
                 <div className="bg-white w-full max-w-sm rounded-2xl overflow-hidden shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>
                     <div className="bg-gray-100 p-4 border-b flex justify-between items-center"><h3 className="font-bold text-gray-700 flex items-center gap-2"><Eye size={18} /> Auditoria</h3><button onClick={onClose}><X size={20} /></button></div>
                     <div className="p-6 space-y-4">
@@ -364,7 +362,7 @@
                 return () => { try { if (html5QrCode.isScanning) html5QrCode.stop(); } catch (e) { } };
             }, []);
             return (
-                <div className="fixed inset-0 z-50 bg-black flex flex-col items-center justify-center">
+                <div className="fixed inset-0 z-[60] bg-black flex flex-col items-center justify-center">
                     <div id="reader" className="w-full h-full absolute inset-0"></div>
                     <div className="absolute top-4 right-4 z-50"><button onClick={onClose} className="bg-white/20 backdrop-blur text-white p-2 rounded-full"><div className="rotate-45"><Plus /></div></button></div>
                     <div className="absolute bottom-10 left-0 right-0 px-6 z-50 flex flex-col gap-3"><div className="bg-black/40 backdrop-blur text-white py-2 px-4 rounded-full text-center text-sm mb-2">Aponte para o código</div><button onClick={onManualRequest} className="w-full bg-white text-gray-900 font-bold py-4 rounded-xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition"><Keyboard size={20} /> Digitar Manualmente</button></div>
@@ -392,7 +390,7 @@
             }, [item, currentListId, historyScope]);
 
             return (
-                <div className="fixed inset-0 z-50 bg-gray-100 flex flex-col animate-slide-up">
+                <div className="fixed inset-0 z-[60] bg-gray-100 flex flex-col animate-slide-up">
                     <div className="bg-white p-4 shadow-sm flex items-center justify-between"><button onClick={onClose}><ArrowLeft size={24} /></button><h2 className="font-bold text-lg">Ficha Técnica</h2><div className="w-6"></div></div>
                     <div className="p-6 space-y-6 overflow-y-auto flex-1 pb-32">
                         <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 space-y-4">
@@ -445,7 +443,7 @@
             };
 
             return (
-                <div className="fixed inset-0 z-40 bg-gray-100 flex flex-col h-full animate-slide-up">
+                <div className="fixed inset-0 z-[60] bg-gray-100 flex flex-col h-full animate-slide-up">
                     <div className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-10"><button onClick={onCancel} className="p-2"><ArrowLeft size={24} /></button><h2 className="font-bold text-lg">{existingItem ? 'Editar' : 'Registrar'}</h2><div className="w-8"></div></div>
                     <form onSubmit={handleSubmit} className="p-5 space-y-4 max-w-lg mx-auto w-full pb-32 overflow-y-auto">
                         <div className="bg-gray-200 p-1 rounded-xl flex mb-4"><button type="button" onClick={() => { setInputType('unit'); setVolumeUnit('g'); }} className={`flex-1 py-2 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition ${inputType === 'unit' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}><Package size={16} /> Unidade</button><button type="button" onClick={() => { setInputType('bulk'); setVolumeUnit('kg'); }} className={`flex-1 py-2 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition ${inputType === 'bulk' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}><Scale size={16} /> Granel</button></div>
