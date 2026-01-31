@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Smart Shop Sync Ultimate (Financeiro)</title>
+    <title>Smart Shop Sync Ultimate</title>
 
     <!-- Bibliotecas Externas -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
@@ -33,8 +33,9 @@
             border-radius: 12px;
         }
 
+        /* Garante que o conteúdo não fique escondido pela barra do navegador */
         .safe-area-pb {
-            padding-bottom: env(safe-area-inset-bottom);
+            padding-bottom: calc(env(safe-area-inset-bottom) + 80px);
         }
 
         /* Animações */
@@ -121,8 +122,6 @@
             });
         };
 
-        // --- IDENTIDADE DO DISPOSITIVO (NOVIDADE) ---
-        // Cria um RG único para este celular e salva para sempre no navegador
         const getDeviceId = () => {
             let id = localStorage.getItem('smart_shop_device_id');
             if (!id) {
@@ -131,7 +130,7 @@
             }
             return id;
         };
-        const DEVICE_ID = getDeviceId(); // Constante global com o ID deste celular
+        const DEVICE_ID = getDeviceId();
 
         const safeDate = (dateInput) => {
             if (!dateInput) return new Date();
@@ -144,43 +143,14 @@
         const formatCurrency = (val) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(val || 0);
         const roundTwo = (num) => Math.round((num + Number.EPSILON) * 100) / 100;
 
-        // --- BANCO DE DADOS (Schema Atualizado v3 - Campo boughtBy) ---
+        // --- BANCO DE DADOS (v4: Adicionado updatedAt para resolução de conflitos) ---
         const db = new Dexie('SmartShopSyncDB');
-        db.version(3).stores({
-            shoppingLists: 'id, name, createdAt, status',
-            items: 'id, listId, name, status, boughtBy', // NOVIDADE: boughtBy armazena o ID de quem comprou
+        db.version(4).stores({
+            shoppingLists: 'id, name, createdAt, status, updatedAt',
+            items: 'id, listId, name, status, boughtBy, updatedAt',
             products: 'barcode, brand, description, volumeValue, volumeUnit, lastPrice, lastDate, inputType',
             cartLog: 'id, date, listId, barcode, brand, description, price, name'
         });
-
-        // --- FUZZY SEARCH ---
-        const levenshteinDistance = (a, b) => {
-            if (a.length === 0) return b.length;
-            if (b.length === 0) return a.length;
-            const matrix = [];
-            for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-            for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
-            for (let i = 1; i <= b.length; i++) {
-                for (let j = 1; j <= a.length; j++) {
-                    if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                        matrix[i][j] = matrix[i - 1][j - 1];
-                    } else {
-                        matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, Math.min(matrix[i][j - 1] + 1, matrix[i - 1][j] + 1));
-                    }
-                }
-            }
-            return matrix[b.length][a.length];
-        };
-
-        const fuzzySearch = (query, items, keySelector, threshold = 3) => {
-            if (!query) return [];
-            const q = query.toLowerCase();
-            return items.filter(item => {
-                const text = keySelector(item).toLowerCase();
-                if (text.includes(q)) return true;
-                return levenshteinDistance(text, q) <= threshold;
-            }).slice(0, 10);
-        };
 
         // --- DEBUG LOGGER ---
         const debugLog = {
@@ -193,7 +163,7 @@
             subscribe(cb) { this.listeners.push(cb); return () => this.listeners = this.listeners.filter(l => l !== cb); }
         };
 
-        // --- SERVIÇO DE SINCRONIZAÇÃO ---
+        // --- SERVIÇO DE SINCRONIZAÇÃO (COM LAST WRITE WINS) ---
         class SyncService {
             constructor() {
                 this.socket = null;
@@ -206,29 +176,23 @@
             connect() {
                 if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) return;
                 this.updateStatus('connecting');
-                debugLog.add(`Conectando...`, 'network');
 
                 try {
                     this.socket = new WebSocket(this.url);
-
                     this.socket.onopen = () => {
                         this.updateStatus('online');
-                        debugLog.add('Online! Sync iniciado.', 'success');
                         this.send('REQUEST_FULL_SYNC', {});
                     };
-
                     this.socket.onclose = () => {
                         this.updateStatus('offline');
                         this.socket = null;
                         clearTimeout(this.reconnectTimer);
                         this.reconnectTimer = setTimeout(() => this.connect(), 5000);
                     };
-
                     this.socket.onmessage = async (event) => {
                         try {
                             const data = JSON.parse(event.data);
                             if (data.type === 'PING') return;
-                            debugLog.add(`Rx: ${data.type}`, 'network');
                             await this.handleIncomingData(data);
                         } catch (e) { console.error(e); }
                     };
@@ -239,6 +203,18 @@
                 if (this.socket && this.socket.readyState === WebSocket.OPEN) {
                     this.socket.send(JSON.stringify({ type, payload }));
                 }
+            }
+
+            // Lógica Central de "Last Write Wins"
+            async shouldUpdate(table, incomingItem) {
+                if (!incomingItem || !incomingItem.id) return true;
+                const localItem = await table.get(incomingItem.id);
+                // Se não existe localmente, atualiza.
+                if (!localItem) return true;
+                // Se o que chegou é mais novo (updatedAt maior), atualiza.
+                const localTime = new Date(localItem.updatedAt || 0).getTime();
+                const incomingTime = new Date(incomingItem.updatedAt || 0).getTime();
+                return incomingTime > localTime;
             }
 
             async handleIncomingData(data) {
@@ -253,25 +229,32 @@
                 }
                 else if (data.type === 'FULL_SYNC_RESPONSE') {
                     const { lists, items, products, logs } = data.payload;
+                    // Tratamento simples para full sync (pode sobrescrever, mas ok no boot)
                     const cleanLists = lists.map(l => ({ ...l, createdAt: safeDate(l.createdAt) }));
                     const cleanLogs = (logs || []).map(l => ({ ...l, date: safeDate(l.date) }));
                     const cleanProducts = (products || []).map(p => ({ ...p, lastDate: safeDate(p.lastDate) }));
 
                     if (cleanLists.length) await db.shoppingLists.bulkPut(cleanLists);
-                    if (items.length) await db.items.bulkPut(items); // Syncs boughtBy automatically
+                    if (items.length) await db.items.bulkPut(items);
                     if (cleanProducts.length) await db.products.bulkPut(cleanProducts);
                     if (cleanLogs.length) await db.cartLog.bulkPut(cleanLogs);
 
                     window.dispatchEvent(new Event('external-data-change'));
                 }
                 else if (data.type === 'SYNC_ITEM_UPDATE') {
-                    await db.items.put(data.payload);
-                    window.dispatchEvent(new Event('external-data-change'));
+                    if (await this.shouldUpdate(db.items, data.payload)) {
+                        await db.items.put(data.payload);
+                        window.dispatchEvent(new Event('external-data-change'));
+                    } else {
+                        debugLog.add(`Ignorando update antigo para item ${data.payload.name}`, 'info');
+                    }
                 }
                 else if (data.type === 'SYNC_LIST_UPDATE') {
                     const list = { ...data.payload, createdAt: safeDate(data.payload.createdAt) };
-                    await db.shoppingLists.put(list);
-                    window.dispatchEvent(new Event('external-data-change'));
+                    if (await this.shouldUpdate(db.shoppingLists, list)) {
+                        await db.shoppingLists.put(list);
+                        window.dispatchEvent(new Event('external-data-change'));
+                    }
                 }
                 else if (data.type === 'SYNC_LIST_DELETE') {
                     await db.shoppingLists.delete(data.payload.id);
@@ -302,161 +285,93 @@
 
         const syncService = new SyncService();
 
-        // --- ÍCONES ---
-        const IconBase = ({ children, size = 24, className = "" }) => (
-            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>{children}</svg>
-        );
+        // --- FUZZY SEARCH E ÍCONES ---
+        const levenshteinDistance = (a, b) => { if (a.length == 0) return b.length; if (b.length == 0) return a.length; const m = []; for (let i = 0; i <= b.length; i++)m[i] = [i]; for (let j = 0; j <= a.length; j++)m[0][j] = j; for (let i = 1; i <= b.length; i++) { for (let j = 1; j <= a.length; j++) { if (b.charAt(i - 1) === a.charAt(j - 1)) { m[i][j] = m[i - 1][j - 1] } else { m[i][j] = Math.min(m[i - 1][j - 1] + 1, Math.min(m[i][j - 1] + 1, m[i - 1][j] + 1)) } } } return m[b.length][a.length] };
+        const fuzzySearch = (query, items, keySelector, threshold = 3) => { if (!query) return []; const q = query.toLowerCase(); return items.filter(item => { const text = keySelector(item).toLowerCase(); if (text.includes(q)) return true; return levenshteinDistance(text, q) <= threshold }).slice(0, 10) };
 
+        const IconBase = ({ children, size = 24, className = "" }) => (<svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>{children}</svg>);
         const Icons = {
-            Plus: (props) => <IconBase {...props}><path d="M5 12h14" /><path d="M12 5v14" /></IconBase>,
-            Scan: (props) => <IconBase {...props}><path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" /><path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" /></IconBase>,
-            Trash2: (props) => <IconBase {...props}><path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" /></IconBase>,
-            CheckCircle: (props) => <IconBase {...props}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></IconBase>,
-            ArrowLeft: (props) => <IconBase {...props}><path d="m12 19-7-7 7-7" /><path d="M19 12H5" /></IconBase>,
-            Keyboard: (props) => <IconBase {...props}><rect x="2" y="4" width="20" height="16" rx="2" ry="2" /><line x1="6" y1="8" x2="6" y2="8" /><line x1="10" y1="8" x2="10" y2="8" /><line x1="14" y1="8" x2="14" y2="8" /><line x1="18" y1="8" x2="18" y2="8" /><line x1="6" y1="12" x2="6" y2="12" /><line x1="10" y1="12" x2="10" y2="12" /><line x1="14" y1="12" x2="14" y2="12" /><line x1="18" y1="12" x2="18" y2="12" /><line x1="6" y1="16" x2="18" y2="16" /></IconBase>,
-            Edit: (props) => <IconBase {...props}><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></IconBase>,
-            Lock: (props) => <IconBase {...props}><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></IconBase>,
-            FileDown: (props) => <IconBase {...props}><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" /><path d="M14 2v4a2 2 0 0 0 2 2h4" /><path d="M12 18v-6" /><path d="m9 15 3 3 3-3" /></IconBase>,
-            TrendingUp: (props) => <IconBase {...props}><polyline points="23 6 13.5 15.5 8.5 10.5 1 18" /><polyline points="17 6 23 6 23 12" /></IconBase>,
-            Scale: (props) => <IconBase {...props}><path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" /><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" /><path d="M7 21h10" /><path d="M12 3v18" /><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" /></IconBase>,
-            Package: (props) => <IconBase {...props}><path d="m7.5 4.27 9 5.15" /><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" /><path d="m3.3 7 8.7 5 8.7-5" /><path d="M12 22v-10" /></IconBase>,
-            Database: (props) => <IconBase {...props}><ellipse cx="12" cy="5" rx="9" ry="3" /><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" /><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" /></IconBase>,
-            Tag: (props) => <IconBase {...props}><path d="M12 2H2v10l9.29 9.29c.94.94 2.48.94 3.42 0l6.58-6.58c.94-.94 .94-2.48 0-3.42L12 2Z" /><path d="M7 7h.01" /></IconBase>,
-            Barcode: (props) => <IconBase {...props}><path d="M3 5v14" /><path d="M8 5v14" /><path d="M12 5v14" /><path d="M17 5v14" /><path d="M21 5v14" /></IconBase>,
-            Eye: (props) => <IconBase {...props}><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></IconBase>,
-            X: (props) => <IconBase {...props}><path d="M18 6 6 18" /><path d="m6 6 18 12" /></IconBase>,
-            Bug: (props) => <IconBase {...props}><rect width="8" height="14" x="8" y="6" rx="4" /><path d="m19 7-3 2" /><path d="m5 7 3 2" /><path d="m19 19-3-2" /><path d="m5 19 3-2" /><path d="M20 13h-4" /><path d="M4 13h4" /><path d="m10 4 1 2" /></IconBase>,
-            User: (props) => <IconBase {...props}><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></IconBase>,
-            Users: (props) => <IconBase {...props}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></IconBase>
+            Plus: (p) => <IconBase {...p}><path d="M5 12h14" /><path d="M12 5v14" /></IconBase>,
+            Scan: (p) => <IconBase {...p}><path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" /><path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" /></IconBase>,
+            Trash2: (p) => <IconBase {...p}><path d="M3 6h18" /><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" /><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" /><line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" /></IconBase>,
+            ArrowLeft: (p) => <IconBase {...p}><path d="m12 19-7-7 7-7" /><path d="M19 12H5" /></IconBase>,
+            Keyboard: (p) => <IconBase {...p}><rect x="2" y="4" width="20" height="16" rx="2" ry="2" /><line x1="6" y1="8" x2="6" y2="8" /><line x1="10" y1="8" x2="10" y2="8" /><line x1="14" y1="8" x2="14" y2="8" /><line x1="18" y1="8" x2="18" y2="8" /><line x1="6" y1="12" x2="6" y2="12" /><line x1="10" y1="12" x2="10" y2="12" /><line x1="14" y1="12" x2="14" y2="12" /><line x1="18" y1="12" x2="18" y2="12" /><line x1="6" y1="16" x2="18" y2="16" /></IconBase>,
+            Edit: (p) => <IconBase {...p}><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></IconBase>,
+            Lock: (p) => <IconBase {...p}><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></IconBase>,
+            FileDown: (p) => <IconBase {...p}><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" /><path d="M14 2v4a2 2 0 0 0 2 2h4" /><path d="M12 18v-6" /><path d="m9 15 3 3 3-3" /></IconBase>,
+            TrendingUp: (p) => <IconBase {...p}><polyline points="23 6 13.5 15.5 8.5 10.5 1 18" /><polyline points="17 6 23 6 23 12" /></IconBase>,
+            Package: (p) => <IconBase {...p}><path d="m7.5 4.27 9 5.15" /><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z" /><path d="m3.3 7 8.7 5 8.7-5" /><path d="M12 22v-10" /></IconBase>,
+            Scale: (p) => <IconBase {...p}><path d="m16 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" /><path d="m2 16 3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1Z" /><path d="M7 21h10" /><path d="M12 3v18" /><path d="M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2" /></IconBase>,
+            Database: (p) => <IconBase {...p}><ellipse cx="12" cy="5" rx="9" ry="3" /><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" /><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" /></IconBase>,
+            Tag: (p) => <IconBase {...p}><path d="M12 2H2v10l9.29 9.29c.94.94 2.48.94 3.42 0l6.58-6.58c.94-.94 .94-2.48 0-3.42L12 2Z" /><path d="M7 7h.01" /></IconBase>,
+            Barcode: (p) => <IconBase {...p}><path d="M3 5v14" /><path d="M8 5v14" /><path d="M12 5v14" /><path d="M17 5v14" /><path d="M21 5v14" /></IconBase>,
+            Eye: (p) => <IconBase {...p}><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></IconBase>,
+            X: (p) => <IconBase {...p}><path d="M18 6 6 18" /><path d="m6 6 18 12" /></IconBase>,
+            Bug: (p) => <IconBase {...p}><rect width="8" height="14" x="8" y="6" rx="4" /><path d="m19 7-3 2" /><path d="m5 7 3 2" /><path d="m19 19-3-2" /><path d="m5 19 3-2" /><path d="M20 13h-4" /><path d="M4 13h4" /><path d="m10 4 1 2" /></IconBase>,
+            User: (p) => <IconBase {...p}><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></IconBase>
         };
+        const { Plus, Scan, Trash2, ArrowLeft, Keyboard, Edit, Lock, FileDown, TrendingUp, Scale, Package, Database, Tag, Barcode, Eye, X, Bug, User } = Icons;
 
-        const { Plus, Scan, Trash2, CheckCircle, ArrowLeft, Keyboard, Edit, Lock, FileDown, TrendingUp, Scale, Package, Database, Tag, Barcode, Eye, X, Bug, User, Users } = Icons;
-
-        // --- PAINEL DE DEBUG ---
+        // --- COMPONENTES AUXILIARES E MODAIS ---
         const DebugConsole = () => {
             const [logs, setLogs] = React.useState([]);
             const [isOpen, setIsOpen] = React.useState(false);
             const messagesEndRef = React.useRef(null);
             React.useEffect(() => debugLog.subscribe(entry => setLogs(prev => [...prev.slice(-19), entry])), []);
             React.useEffect(() => { if (isOpen && messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: "smooth" }); }, [logs, isOpen]);
-
-            if (!isOpen) return (
-                <button onClick={() => setIsOpen(true)} className="fixed bottom-4 right-4 bg-gray-800 text-white p-3 rounded-full shadow-lg z-[100] opacity-50 hover:opacity-100">
-                    <Bug size={20} />
-                </button>
-            );
-
+            if (!isOpen) return <button onClick={() => setIsOpen(true)} className="fixed bottom-4 right-4 bg-gray-800 text-white p-3 rounded-full shadow-lg z-[100] opacity-50 hover:opacity-100"><Bug size={20} /></button>;
             return (
                 <div className="fixed bottom-0 left-0 right-0 h-48 bg-gray-900 text-green-400 font-mono text-xs z-[100] flex flex-col shadow-2xl border-t border-gray-700">
-                    <div className="flex justify-between items-center p-2 bg-gray-800 border-b border-gray-700">
-                        <span className="font-bold text-gray-300">Rede & Sync</span>
-                        <div className="flex gap-2">
-                            <button onClick={() => syncService.send('REQUEST_FULL_SYNC', {})} className="bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-500 text-[10px]">Forçar Sync</button>
-                            <button onClick={() => setIsOpen(false)} className="text-gray-400 hover:text-white px-2">X</button>
-                        </div>
-                    </div>
-                    <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                        {logs.map((l) => (
-                            <div key={l.id} className={l.type === 'error' ? 'text-red-400' : l.type === 'network' ? 'text-blue-300' : 'text-green-400'}>
-                                <span className="opacity-50">[{l.time}]</span> {l.msg}
-                            </div>
-                        ))}
-                        <div ref={messagesEndRef} />
-                    </div>
+                    <div className="flex justify-between items-center p-2 bg-gray-800 border-b border-gray-700"><span className="font-bold text-gray-300">Rede & Sync</span><div className="flex gap-2"><button onClick={() => syncService.send('REQUEST_FULL_SYNC', {})} className="bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-500 text-[10px]">Forçar Sync</button><button onClick={() => setIsOpen(false)} className="text-gray-400 hover:text-white px-2">X</button></div></div>
+                    <div className="flex-1 overflow-y-auto p-2 space-y-1">{logs.map((l) => (<div key={l.id} className={l.type === 'error' ? 'text-red-400' : l.type === 'network' ? 'text-blue-300' : 'text-green-400'}><span className="opacity-50">[{l.time}]</span> {l.msg}</div>))}<div ref={messagesEndRef} /></div>
                 </div>
             );
         };
 
-        // --- MODAL: SELEÇÃO DE INPUT ---
         const InputSelectionModal = ({ onSelect, onClose }) => (
             <div className="fixed inset-0 z-50 bg-black/60 flex items-end justify-center animate-fade-in" onClick={onClose}>
                 <div className="bg-white w-full max-w-md rounded-t-2xl p-6 animate-slide-up space-y-4" onClick={e => e.stopPropagation()}>
                     <div className="w-12 h-1.5 bg-gray-300 rounded-full mx-auto mb-2"></div>
                     <h3 className="text-lg font-bold text-center text-gray-800">Modo de Registro</h3>
                     <div className="grid grid-cols-2 gap-4">
-                        <button onClick={() => onSelect('SCAN')} className="flex flex-col items-center justify-center bg-blue-50 hover:bg-blue-100 p-6 rounded-xl border-2 border-blue-100 transition active:scale-95">
-                            <div className="bg-blue-600 text-white p-3 rounded-full mb-3 shadow-lg"><Scan size={28} /></div>
-                            <span className="font-bold text-blue-700">Ler Código</span>
-                        </button>
-                        <button onClick={() => onSelect('MANUAL')} className="flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 p-6 rounded-xl border-2 border-gray-100 transition active:scale-95">
-                            <div className="bg-gray-600 text-white p-3 rounded-full mb-3 shadow-lg"><Keyboard size={28} /></div>
-                            <span className="font-bold text-gray-700">Manual</span>
-                        </button>
+                        <button onClick={() => onSelect('SCAN')} className="flex flex-col items-center justify-center bg-blue-50 hover:bg-blue-100 p-6 rounded-xl border-2 border-blue-100 transition active:scale-95"><div className="bg-blue-600 text-white p-3 rounded-full mb-3 shadow-lg"><Scan size={28} /></div><span className="font-bold text-blue-700">Ler Código</span></button>
+                        <button onClick={() => onSelect('MANUAL')} className="flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 p-6 rounded-xl border-2 border-gray-100 transition active:scale-95"><div className="bg-gray-600 text-white p-3 rounded-full mb-3 shadow-lg"><Keyboard size={28} /></div><span className="font-bold text-gray-700">Manual</span></button>
                     </div>
                 </div>
             </div>
         );
 
-        // --- MODAL: DETALHE DO HISTÓRICO ---
         const HistoryDetailModal = ({ log, onClose }) => (
             <div className="fixed inset-0 z-[60] bg-black/70 flex items-center justify-center p-4 animate-fade-in" onClick={onClose}>
                 <div className="bg-white w-full max-w-sm rounded-2xl overflow-hidden shadow-2xl animate-slide-up" onClick={e => e.stopPropagation()}>
-                    <div className="bg-gray-100 p-4 border-b flex justify-between items-center">
-                        <h3 className="font-bold text-gray-700 flex items-center gap-2"><Eye size={18} /> Auditoria de Registro</h3>
-                        <button onClick={onClose}><X size={20} /></button>
-                    </div>
+                    <div className="bg-gray-100 p-4 border-b flex justify-between items-center"><h3 className="font-bold text-gray-700 flex items-center gap-2"><Eye size={18} /> Auditoria</h3><button onClick={onClose}><X size={20} /></button></div>
                     <div className="p-6 space-y-4">
-                        <div className="text-center mb-4">
-                            <h2 className="text-xl font-bold text-gray-800">{log.name || 'Item sem nome'}</h2>
-                            <p className="text-gray-500 text-sm">{log.brand}</p>
-                            {log.description && <p className="text-sm text-gray-600 italic mt-1">{log.description}</p>}
-                        </div>
+                        <div className="text-center mb-4"><h2 className="text-xl font-bold text-gray-800">{log.name}</h2><p className="text-gray-500 text-sm">{log.brand}</p></div>
                         <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm border-t border-b py-4">
-                            <div className="text-gray-500">Lista Origem</div>
-                            <div className="font-bold text-right truncate">{log.listName || 'N/A'}</div>
-                            <div className="text-gray-500">Data</div>
-                            <div className="font-bold text-right">{formatDate(log.date)}</div>
-                            <div className="text-gray-500">Código</div>
-                            <div className="font-bold text-right font-mono text-xs">{log.barcode || 'Manual'}</div>
-                            <div className="text-gray-500">Tipo</div>
-                            <div className="font-bold text-right">{log.inputType === 'bulk' ? 'Granel' : 'Unitário'}</div>
-                            <div className="text-gray-500">{log.inputType === 'bulk' ? 'Peso' : 'Qtd'}</div>
-                            <div className="font-bold text-right">{log.inputType === 'bulk' ? `${log.volumeValue} ${log.volumeUnit}` : log.quantity}</div>
-                            <div className="text-gray-500">Preço Unit/Kg</div>
-                            <div className="font-bold text-right">{formatCurrency(log.price)}</div>
-                        </div>
-                        <div className="text-center pt-2">
-                            <p className="text-xs text-gray-400 uppercase font-bold">Valor Total no Registro</p>
-                            <p className="text-2xl font-bold text-blue-600">
-                                {formatCurrency(log.inputType === 'bulk' ? (log.price * (parseFloat(log.volumeValue) || 0)) : (log.price * log.quantity))}
-                            </p>
+                            <div className="text-gray-500">Lista Origem</div><div className="font-bold text-right truncate">{log.listName || 'N/A'}</div>
+                            <div className="text-gray-500">Data</div><div className="font-bold text-right">{formatDate(log.date)}</div>
+                            <div className="text-gray-500">Valor</div><div className="font-bold text-right text-blue-600">{formatCurrency(log.price * log.quantity)}</div>
                         </div>
                     </div>
                 </div>
             </div>
         );
 
-        // --- SCANNER ---
         const Scanner = ({ onScan, onManualRequest, onClose }) => {
             React.useEffect(() => {
                 const html5QrCode = new Html5Qrcode("reader");
-                const config = { fps: 10, qrbox: { width: 250, height: 250 } };
-                setTimeout(() => {
-                    html5QrCode.start({ facingMode: "environment" }, config,
-                        (decodedText) => html5QrCode.stop().then(() => onScan(decodedText)),
-                        (err) => { }
-                    ).catch(err => { console.error(err); onManualRequest(); });
-                }, 100);
+                setTimeout(() => { html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => html5QrCode.stop().then(() => onScan(decodedText)), () => { }).catch(err => { console.error(err); onManualRequest(); }); }, 100);
                 return () => { try { if (html5QrCode.isScanning) html5QrCode.stop(); } catch (e) { } };
             }, []);
-
             return (
                 <div className="fixed inset-0 z-50 bg-black flex flex-col items-center justify-center">
                     <div id="reader" className="w-full h-full absolute inset-0"></div>
-                    <div className="absolute top-4 right-4 z-50">
-                        <button onClick={onClose} className="bg-white/20 backdrop-blur text-white p-2 rounded-full"><div className="rotate-45"><Plus /></div></button>
-                    </div>
-                    <div className="absolute bottom-10 left-0 right-0 px-6 z-50 flex flex-col gap-3">
-                        <div className="bg-black/40 backdrop-blur text-white py-2 px-4 rounded-full text-center text-sm mb-2">Aponte para o código</div>
-                        <button onClick={onManualRequest} className="w-full bg-white text-gray-900 font-bold py-4 rounded-xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition">
-                            <Keyboard size={20} /> Digitar Manualmente
-                        </button>
-                    </div>
+                    <div className="absolute top-4 right-4 z-50"><button onClick={onClose} className="bg-white/20 backdrop-blur text-white p-2 rounded-full"><div className="rotate-45"><Plus /></div></button></div>
+                    <div className="absolute bottom-10 left-0 right-0 px-6 z-50 flex flex-col gap-3"><div className="bg-black/40 backdrop-blur text-white py-2 px-4 rounded-full text-center text-sm mb-2">Aponte para o código</div><button onClick={onManualRequest} className="w-full bg-white text-gray-900 font-bold py-4 rounded-xl shadow-xl flex items-center justify-center gap-2 active:scale-95 transition"><Keyboard size={20} /> Digitar Manualmente</button></div>
                 </div>
             );
         };
 
-        // --- ITEM DETAILS ---
         const ItemDetails = ({ item, currentListId, onClose, onEdit, onDelete, isReadOnly }) => {
             const [history, setHistory] = React.useState([]);
             const [historyScope, setHistoryScope] = React.useState(item?.barcode ? 'CODE' : 'NAME');
@@ -465,80 +380,29 @@
             React.useEffect(() => {
                 const fetchHistory = async () => {
                     let logs = [];
-                    if (historyScope === 'CODE' && item?.barcode) {
-                        logs = await db.cartLog.where('barcode').equals(item.barcode).toArray();
-                    } else {
-                        const allLogs = await db.cartLog.toArray();
-                        logs = fuzzySearch(item.name, allLogs, (log) => log.name || log.brand + ' ' + log.barcode, 3);
-                    }
+                    if (historyScope === 'CODE' && item?.barcode) logs = await db.cartLog.where('barcode').equals(item.barcode).toArray();
+                    else { const allLogs = await db.cartLog.toArray(); logs = fuzzySearch(item.name, allLogs, (log) => log.name || log.brand + ' ' + log.barcode, 3); }
                     const lists = await db.shoppingLists.toArray();
                     const listMap = new Map(lists.map(l => [l.id, l.name]));
-                    const enrichedLogs = logs
-                        .filter(log => listMap.has(log.listId))
-                        .map(log => ({ ...log, listName: listMap.get(log.listId), isCurrent: log.listId === currentListId }));
-                    const uniqueLogs = Array.from(new Map(enrichedLogs.map(log => [log.id, log])).values());
-                    uniqueLogs.sort((a, b) => b.date - a.date);
-                    setHistory(uniqueLogs);
+                    const enrichedLogs = logs.filter(log => listMap.has(log.listId)).map(log => ({ ...log, listName: listMap.get(log.listId), isCurrent: log.listId === currentListId }));
+                    enrichedLogs.sort((a, b) => b.date - a.date);
+                    setHistory(enrichedLogs);
                 };
                 fetchHistory();
             }, [item, currentListId, historyScope]);
 
             return (
                 <div className="fixed inset-0 z-50 bg-gray-100 flex flex-col animate-slide-up">
-                    <div className="bg-white p-4 shadow-sm flex items-center justify-between">
-                        <button onClick={onClose}><ArrowLeft size={24} /></button>
-                        <h2 className="font-bold text-lg">Ficha Técnica</h2>
-                        <div className="w-6"></div>
-                    </div>
-                    <div className="p-6 space-y-6 overflow-y-auto flex-1">
+                    <div className="bg-white p-4 shadow-sm flex items-center justify-between"><button onClick={onClose}><ArrowLeft size={24} /></button><h2 className="font-bold text-lg">Ficha Técnica</h2><div className="w-6"></div></div>
+                    <div className="p-6 space-y-6 overflow-y-auto flex-1 pb-32">
                         <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100 space-y-4">
-                            <div className="text-center border-b pb-4">
-                                <h1 className="text-2xl font-bold text-gray-800">{item.name}</h1>
-                                <p className="text-gray-500">{item.brand}</p>
-                                {item.description && <p className="text-sm text-gray-600 italic mt-1">{item.description}</p>}
-                            </div>
-                            <div className="grid grid-cols-2 gap-4 text-sm">
-                                <div><span className="block text-gray-400 text-xs uppercase">Código</span><span className="font-mono text-gray-700">{item.barcode || 'Manual'}</span></div>
-                                <div><span className="block text-gray-400 text-xs uppercase">Tipo</span><span className="font-bold text-blue-600">{item.inputType === 'bulk' ? 'Granel' : 'Unitário'}</span></div>
-                                <div><span className="block text-gray-400 text-xs uppercase">Volume</span><span className="text-gray-700">{item.volumeValue ? `${item.volumeValue}${item.volumeUnit}` : '-'}</span></div>
-                                <div><span className="block text-gray-400 text-xs uppercase">{item.inputType === 'bulk' ? 'Preço/kg' : 'Unitário'}</span><span className="text-gray-700">{formatCurrency(item.unitPrice || 0)}</span></div>
-                            </div>
-                            <div className="bg-green-50 p-4 rounded-xl text-center">
-                                <span className="text-green-800 text-xs uppercase font-bold">Total Pago</span>
-                                <div className="text-3xl font-bold text-green-700">{formatCurrency(item.finalPrice || 0)}</div>
-                            </div>
+                            <div className="text-center border-b pb-4"><h1 className="text-2xl font-bold text-gray-800">{item.name}</h1><p className="text-gray-500">{item.brand}</p></div>
+                            <div className="bg-green-50 p-4 rounded-xl text-center"><span className="text-green-800 text-xs uppercase font-bold">Total Pago</span><div className="text-3xl font-bold text-green-700">{formatCurrency(item.finalPrice || 0)}</div></div>
                         </div>
-                        {!isReadOnly && (
-                            <div className="grid grid-cols-2 gap-4">
-                                <button onClick={onEdit} className="bg-blue-100 text-blue-700 p-4 rounded-xl font-bold flex items-center justify-center gap-2"><Edit size={20} /> Editar</button>
-                                <button onClick={onDelete} className="bg-red-100 text-red-700 p-4 rounded-xl font-bold flex items-center justify-center gap-2"><Trash2 size={20} /> Excluir</button>
-                            </div>
-                        )}
+                        {!isReadOnly && (<div className="grid grid-cols-2 gap-4"><button onClick={onEdit} className="bg-blue-100 text-blue-700 p-4 rounded-xl font-bold flex items-center justify-center gap-2"><Edit size={20} /> Editar</button><button onClick={onDelete} className="bg-red-100 text-red-700 p-4 rounded-xl font-bold flex items-center justify-center gap-2"><Trash2 size={20} /> Excluir</button></div>)}
                         <div>
-                            <div className="flex items-center justify-between mb-3 mt-4">
-                                <h3 className="font-bold text-gray-500 uppercase text-xs flex items-center gap-2"><TrendingUp size={14} /> Histórico</h3>
-                                <div className="bg-gray-200 p-0.5 rounded-lg flex text-[10px] font-bold">
-                                    <button onClick={() => setHistoryScope('CODE')} disabled={!item.barcode} className={`px-2 py-1 rounded-md transition ${historyScope === 'CODE' ? 'bg-white shadow text-blue-600' : 'text-gray-500'}`}><Barcode size={12} className="inline mr-1" /> Código</button>
-                                    <button onClick={() => setHistoryScope('NAME')} className={`px-2 py-1 rounded-md transition ${historyScope === 'NAME' ? 'bg-white shadow text-blue-600' : 'text-gray-500'}`}><Tag size={12} className="inline mr-1" /> Nome</button>
-                                </div>
-                            </div>
-                            <div className="space-y-2 pb-10">
-                                {history.map(h => (
-                                    <button key={h.id} onClick={() => setViewingLog(h)} className={`w-full p-3 rounded-lg flex justify-between items-center text-sm shadow-sm border active:scale-[0.98] transition text-left ${h.isCurrent ? 'bg-blue-50 border-blue-200' : 'bg-white border-transparent'}`}>
-                                        <div className="flex flex-col max-w-[65%]">
-                                            <span className="text-gray-800 font-bold truncate">{h.listName}</span>
-                                            <div className="flex items-center gap-1 text-gray-400 text-[10px]">
-                                                <span>{formatDate(h.date)}</span>
-                                                <span>•</span>
-                                                <span className="truncate">{h.brand}</span>
-                                            </div>
-                                        </div>
-                                        <div className="text-right">
-                                            <span className="font-bold block">{formatCurrency(h.price)}</span>
-                                        </div>
-                                    </button>
-                                ))}
-                            </div>
+                            <div className="flex items-center justify-between mb-3 mt-4"><h3 className="font-bold text-gray-500 uppercase text-xs flex items-center gap-2"><TrendingUp size={14} /> Histórico</h3><div className="bg-gray-200 p-0.5 rounded-lg flex text-[10px] font-bold"><button onClick={() => setHistoryScope('CODE')} disabled={!item.barcode} className={`px-2 py-1 rounded-md transition ${historyScope === 'CODE' ? 'bg-white shadow text-blue-600' : 'text-gray-500'}`}>Código</button><button onClick={() => setHistoryScope('NAME')} className={`px-2 py-1 rounded-md transition ${historyScope === 'NAME' ? 'bg-white shadow text-blue-600' : 'text-gray-500'}`}>Nome</button></div></div>
+                            <div className="space-y-2">{history.map(h => (<button key={h.id} onClick={() => setViewingLog(h)} className={`w-full p-3 rounded-lg flex justify-between items-center text-sm shadow-sm border ${h.isCurrent ? 'bg-blue-50 border-blue-200' : 'bg-white border-transparent'}`}><div className="flex flex-col text-left"><span className="text-gray-800 font-bold">{h.listName}</span><span className="text-xs text-gray-400">{formatDate(h.date)} • {h.brand}</span></div><span className="font-bold">{formatCurrency(h.price)}</span></button>))}</div>
                         </div>
                     </div>
                     {viewingLog && <HistoryDetailModal log={viewingLog} onClose={() => setViewingLog(null)} />}
@@ -546,7 +410,6 @@
             );
         };
 
-        // --- PRODUCT FORM ---
         const ProductForm = ({ initialBarcode, initialData, linkedItemName, onSave, onCancel, onReScan, existingItem }) => {
             const [inputType, setInputType] = React.useState(existingItem?.inputType || initialData?.inputType || 'unit');
             const [barcode, setBarcode] = React.useState(existingItem?.barcode || initialBarcode || '');
@@ -557,18 +420,13 @@
             const [price, setPrice] = React.useState(existingItem?.unitPrice || initialData?.lastPrice || '');
             const [qty, setQty] = React.useState(existingItem?.quantity || 1);
 
-            // Logic: Scan barcode -> Check local DB (which is now Synced!)
             React.useEffect(() => {
                 if (barcode && barcode.length > 3 && !existingItem && !initialData) {
                     const checkHistory = async () => {
                         const hist = await db.products.get(barcode);
                         if (hist) {
-                            setBrand(hist.brand);
-                            setDesc(hist.description);
-                            setPrice(hist.lastPrice);
-                            setVolumeVal(hist.volumeValue || '');
-                            setVolumeUnit(hist.volumeUnit || 'g');
-                            setInputType(hist.inputType || 'unit');
+                            setBrand(hist.brand); setDesc(hist.description); setPrice(hist.lastPrice);
+                            setVolumeVal(hist.volumeValue || ''); setVolumeUnit(hist.volumeUnit || 'g'); setInputType(hist.inputType || 'unit');
                         }
                     };
                     checkHistory();
@@ -577,70 +435,28 @@
 
             const total = React.useMemo(() => {
                 const p = parseFloat(price) || 0;
-                if (inputType === 'bulk') {
-                    const weight = parseFloat(volumeVal) || 0;
-                    return roundTwo(p * weight);
-                } else {
-                    const q = parseInt(qty) || 1;
-                    return roundTwo(p * q);
-                }
+                if (inputType === 'bulk') { const weight = parseFloat(volumeVal) || 0; return roundTwo(p * weight); }
+                else { const q = parseInt(qty) || 1; return roundTwo(p * q); }
             }, [price, qty, volumeVal, inputType]);
 
             const handleSubmit = (e) => {
                 e.preventDefault();
-                onSave({
-                    barcode, brand, description: desc,
-                    volumeValue: volumeVal, volumeUnit: volumeUnit,
-                    unitPrice: parseFloat(price),
-                    quantity: inputType === 'unit' ? parseInt(qty) : 1,
-                    total: total,
-                    genericName: linkedItemName,
-                    inputType
-                });
+                onSave({ barcode, brand, description: desc, volumeValue: volumeVal, volumeUnit: volumeUnit, unitPrice: parseFloat(price), quantity: inputType === 'unit' ? parseInt(qty) : 1, total: total, genericName: linkedItemName, inputType });
             };
 
             return (
                 <div className="fixed inset-0 z-40 bg-gray-100 flex flex-col h-full animate-slide-up">
-                    <div className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-10">
-                        <button onClick={onCancel} className="p-2"><ArrowLeft size={24} /></button>
-                        <h2 className="font-bold text-lg">{existingItem ? 'Editar' : 'Registrar'}</h2>
-                        <div className="w-8"></div>
-                    </div>
+                    <div className="bg-white p-4 shadow-sm flex items-center justify-between sticky top-0 z-10"><button onClick={onCancel} className="p-2"><ArrowLeft size={24} /></button><h2 className="font-bold text-lg">{existingItem ? 'Editar' : 'Registrar'}</h2><div className="w-8"></div></div>
                     <form onSubmit={handleSubmit} className="p-5 space-y-4 max-w-lg mx-auto w-full pb-32 overflow-y-auto">
-                        <div className="bg-gray-200 p-1 rounded-xl flex mb-4">
-                            <button type="button" onClick={() => { setInputType('unit'); setVolumeUnit('g'); }} className={`flex-1 py-2 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition ${inputType === 'unit' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}><Package size={16} /> Unidade</button>
-                            <button type="button" onClick={() => { setInputType('bulk'); setVolumeUnit('kg'); }} className={`flex-1 py-2 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition ${inputType === 'bulk' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}><Scale size={16} /> Granel</button>
-                        </div>
+                        <div className="bg-gray-200 p-1 rounded-xl flex mb-4"><button type="button" onClick={() => { setInputType('unit'); setVolumeUnit('g'); }} className={`flex-1 py-2 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition ${inputType === 'unit' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}><Package size={16} /> Unidade</button><button type="button" onClick={() => { setInputType('bulk'); setVolumeUnit('kg'); }} className={`flex-1 py-2 px-4 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition ${inputType === 'bulk' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}><Scale size={16} /> Granel</button></div>
                         <div className="bg-blue-50 p-3 rounded-lg border border-blue-100 text-sm mb-2">Item: <strong>{linkedItemName}</strong></div>
-                        <div>
-                            <label className="block text-xs font-bold text-gray-500 uppercase">Código</label>
-                            <div className="relative">
-                                <input type="text" value={barcode} onChange={e => setBarcode(e.target.value)} className="w-full p-3 pr-12 rounded-lg font-mono text-gray-600 mt-1 border bg-white border-gray-300" placeholder="Opcional se manual" />
-                                <button type="button" onClick={() => { setBarcode(''); onReScan(); }} className="absolute right-2 top-1/2 -translate-y-1/2 text-blue-500 p-2 hover:bg-blue-50 rounded-full"><Scan size={20} /></button>
-                            </div>
-                        </div>
+                        <div><label className="block text-xs font-bold text-gray-500 uppercase">Código</label><div className="relative"><input type="text" value={barcode} onChange={e => setBarcode(e.target.value)} className="w-full p-3 pr-12 rounded-lg font-mono text-gray-600 mt-1 border bg-white border-gray-300" placeholder="Opcional se manual" /><button type="button" onClick={() => { setBarcode(''); onReScan(); }} className="absolute right-2 top-1/2 -translate-y-1/2 text-blue-500 p-2 hover:bg-blue-50 rounded-full"><Scan size={20} /></button></div></div>
                         <div><label className="block text-xs font-bold text-gray-500 uppercase">Descrição</label><input required type="text" value={desc} onChange={e => setDesc(e.target.value)} className="w-full border p-3 rounded-lg mt-1 outline-none focus:border-blue-500" placeholder="Ex: Arroz Tio João" /></div>
                         <div><label className="block text-xs font-bold text-gray-500 uppercase">Marca</label><input required type="text" value={brand} onChange={e => setBrand(e.target.value)} className="w-full border p-3 rounded-lg mt-1 outline-none focus:border-blue-500" /></div>
                         <div className="flex gap-4 pt-2 mt-2">
-                            <div className="flex-1">
-                                <label className="block text-xs font-bold text-blue-600 uppercase mb-1">{inputType === 'bulk' ? 'Peso (Kg/L)' : 'Quantidade'}</label>
-                                {inputType === 'unit' ? (
-                                    <div className="flex items-center"><button type="button" onClick={() => setQty(Math.max(1, qty - 1))} className="bg-gray-200 p-3 rounded-l-lg font-bold">-</button><input type="number" value={qty} onChange={e => setQty(Math.max(1, parseInt(e.target.value) || 1))} className="w-full text-center border-y p-3 outline-none" /><button type="button" onClick={() => setQty(qty + 1)} className="bg-gray-200 p-3 rounded-r-lg font-bold">+</button></div>
-                                ) : (
-                                    <div className="flex"><input type="number" step="0.001" value={volumeVal} onChange={e => setVolumeVal(e.target.value)} className="w-full border p-3 rounded-l-lg outline-none font-bold" placeholder="0.000" /><select value={volumeUnit} onChange={e => setVolumeUnit(e.target.value)} className="bg-gray-100 border-y border-r rounded-r-lg px-2 text-sm font-bold"><option value="kg">kg</option><option value="L">L</option></select></div>
-                                )}
-                            </div>
-                            <div className="flex-1">
-                                <label className="block text-xs font-bold text-blue-600 uppercase mb-1">{inputType === 'bulk' ? 'Preço por Kg/L' : 'Preço Unitário'}</label>
-                                <input required type="number" step="0.01" value={price} onChange={e => setPrice(e.target.value)} className="w-full border p-3 rounded-lg font-bold text-gray-700 outline-none" placeholder="R$ 0.00" />
-                            </div>
+                            <div className="flex-1"><label className="block text-xs font-bold text-blue-600 uppercase mb-1">{inputType === 'bulk' ? 'Peso (Kg/L)' : 'Quantidade'}</label>{inputType === 'unit' ? (<div className="flex items-center"><button type="button" onClick={() => setQty(Math.max(1, qty - 1))} className="bg-gray-200 p-3 rounded-l-lg font-bold">-</button><input type="number" value={qty} onChange={e => setQty(Math.max(1, parseInt(e.target.value) || 1))} className="w-full text-center border-y p-3 outline-none" /><button type="button" onClick={() => setQty(qty + 1)} className="bg-gray-200 p-3 rounded-r-lg font-bold">+</button></div>) : (<div className="flex"><input type="number" step="0.001" value={volumeVal} onChange={e => setVolumeVal(e.target.value)} className="w-full border p-3 rounded-l-lg outline-none font-bold" placeholder="0.000" /><select value={volumeUnit} onChange={e => setVolumeUnit(e.target.value)} className="bg-gray-100 border-y border-r rounded-r-lg px-2 text-sm font-bold"><option value="kg">kg</option><option value="L">L</option></select></div>)}</div>
+                            <div className="flex-1"><label className="block text-xs font-bold text-blue-600 uppercase mb-1">{inputType === 'bulk' ? 'Preço por Kg/L' : 'Preço Unitário'}</label><input required type="number" step="0.01" value={price} onChange={e => setPrice(e.target.value)} className="w-full border p-3 rounded-lg font-bold text-gray-700 outline-none" placeholder="R$ 0.00" /></div>
                         </div>
-                        {inputType === 'unit' && (
-                            <div className="flex gap-2 mt-2">
-                                <div className="flex-1"><label className="block text-xs font-bold text-gray-400 uppercase">Volume da Emb. (Info)</label><input type="number" value={volumeVal} onChange={e => setVolumeVal(e.target.value)} className="w-full border p-2 rounded-lg mt-1 text-sm bg-gray-50" placeholder="Ex: 500" /></div>
-                                <div className="w-24"><label className="block text-xs font-bold text-gray-400 uppercase">Un.</label><select value={volumeUnit} onChange={e => setVolumeUnit(e.target.value)} className="w-full border p-2 rounded-lg mt-1 bg-gray-50 text-sm"><option value="g">g</option><option value="kg">kg</option><option value="ml">ml</option><option value="L">L</option><option value="un">un</option></select></div>
-                            </div>
-                        )}
                         <div className="bg-green-50 p-4 rounded-xl border border-green-200 mt-4 flex justify-between items-center"><label className="text-xs font-bold text-green-700 uppercase">Total Calculado</label><div className="text-3xl font-bold text-green-700">{formatCurrency(total)}</div></div>
                         <div className="pt-4"><button type="submit" className="w-full bg-blue-600 text-white p-4 rounded-xl font-bold text-lg shadow-lg flex items-center justify-center gap-2 active:bg-blue-700"><CheckCircle size={24} /> Confirmar</button></div>
                     </form>
@@ -648,7 +464,7 @@
             );
         };
 
-        // --- SHOPPING LIST (O Core do App) ---
+        // --- SHOPPING LIST ---
         const ShoppingList = ({ listId, onBack }) => {
             const [listMeta, setListMeta] = React.useState(null);
             const [items, setItems] = React.useState([]);
@@ -679,25 +495,20 @@
             };
 
             const calculateTotal = () => items.reduce((acc, item) => acc + (item.finalPrice || 0), 0);
+            const calculateMyTotal = () => items.filter(i => i.status === 'bought' && i.boughtBy === DEVICE_ID).reduce((acc, item) => acc + (item.finalPrice || 0), 0);
 
-            // NOVO: Cálculo Individual
-            const calculateMyTotal = () => items
-                .filter(i => i.status === 'bought' && i.boughtBy === DEVICE_ID)
-                .reduce((acc, item) => acc + (item.finalPrice || 0), 0);
-
-            // SYNC: Adicionar Item
             const handleAddItem = async (e) => {
                 e.preventDefault();
                 if (!newItem.trim() || isReadOnly) return;
-                const item = { id: generateUUID(), listId, name: newItem, status: 'pending', unitPrice: 0, finalPrice: 0, quantity: 1 };
+                const item = { id: generateUUID(), listId, name: newItem, status: 'pending', unitPrice: 0, finalPrice: 0, quantity: 1, updatedAt: new Date() };
                 await db.items.add(item);
                 syncService.send('SYNC_ITEM_UPDATE', item);
                 setNewItem('');
                 loadData();
             };
 
-            // SYNC: Salvar Produto (Form)
             const handleSaveProduct = async (data) => {
+                // Bugfix: Garantir que updatedItem tenha ID e dados corretos, evitando overwrite vazio
                 const updatedItem = {
                     ...activeItem,
                     status: 'bought',
@@ -710,12 +521,14 @@
                     volumeValue: data.volumeValue,
                     volumeUnit: data.volumeUnit,
                     inputType: data.inputType,
-                    boughtBy: DEVICE_ID // <--- QUEM SALVOU, COMPROU (Mesmo que edite um item de outro)
+                    boughtBy: DEVICE_ID,
+                    updatedAt: new Date() // CRÍTICO: Atualiza timestamp
                 };
 
                 await db.items.put(updatedItem);
                 syncService.send('SYNC_ITEM_UPDATE', updatedItem);
 
+                // Produto separado (memória de preço)
                 const productData = {
                     barcode: data.barcode, brand: data.brand, description: data.description,
                     volumeValue: data.volumeValue, volumeUnit: data.volumeUnit,
@@ -724,8 +537,9 @@
                 await db.products.put(productData);
                 syncService.send('SYNC_PRODUCT_UPDATE', productData);
 
-                const newTotal = calculateTotal(); // Recalcula
-                await db.shoppingLists.update(listId, { total: newTotal });
+                // Update total lista (opcional, só pra cache visual)
+                const newTotal = calculateTotal();
+                await db.shoppingLists.update(listId, { total: newTotal, updatedAt: new Date() });
 
                 loadData();
                 setViewMode('LIST');
@@ -733,8 +547,7 @@
 
             const handleDeleteItem = async () => {
                 if (confirm("Remover este item da lista?")) {
-                    // Remove propriedade de compra ao voltar pra pendente
-                    const updatedItem = { ...activeItem, status: 'pending', finalPrice: 0, unitPrice: 0, quantity: 1, barcode: null, boughtBy: null };
+                    const updatedItem = { ...activeItem, status: 'pending', finalPrice: 0, unitPrice: 0, quantity: 1, barcode: null, boughtBy: null, updatedAt: new Date() };
                     await db.items.put(updatedItem);
                     syncService.send('SYNC_ITEM_UPDATE', updatedItem);
                     loadData();
@@ -742,28 +555,16 @@
                 }
             };
 
-            // SYNC: Finalizar Lista
             const finalizeList = async () => {
-                if (confirm("Finalizar lista? O histórico será sincronizado.")) {
+                if (confirm("Finalizar lista?")) {
                     const now = new Date();
                     const boughtItems = items.filter(i => i.status === 'bought');
+                    const logs = boughtItems.map(item => ({ id: generateUUID(), date: now, listId, barcode: item.barcode, brand: item.brand, description: item.description, price: item.unitPrice, name: item.name, quantity: item.quantity, volumeValue: item.volumeValue, volumeUnit: item.volumeUnit, inputType: item.inputType }));
+                    if (logs.length > 0) { await db.cartLog.bulkAdd(logs); syncService.send('SYNC_LOG_ADD', logs); }
 
-                    const logs = boughtItems.map(item => ({
-                        id: generateUUID(),
-                        date: now, listId, barcode: item.barcode, brand: item.brand,
-                        description: item.description, price: item.unitPrice, name: item.name,
-                        quantity: item.quantity, volumeValue: item.volumeValue, volumeUnit: item.volumeUnit, inputType: item.inputType
-                    }));
-
-                    if (logs.length > 0) {
-                        await db.cartLog.bulkAdd(logs);
-                        syncService.send('SYNC_LOG_ADD', logs);
-                    }
-
-                    const listUpdate = { status: 'completed', total: calculateTotal() };
+                    const listUpdate = { status: 'completed', total: calculateTotal(), updatedAt: new Date() };
                     await db.shoppingLists.update(listId, listUpdate);
                     syncService.send('SYNC_LIST_UPDATE', { ...listMeta, ...listUpdate });
-
                     loadData();
                 }
             };
@@ -776,7 +577,13 @@
 
             const handleInputSelection = (method) => {
                 if (method === 'SCAN') setViewMode('SCANNER');
-                else { setScannedCode(''); setFormInitialData(null); setEditingItemData(null); setViewMode('FORM'); }
+                else {
+                    setScannedCode('');
+                    // Limpeza de estado para evitar dados residuais de edição anterior
+                    setFormInitialData(null);
+                    setEditingItemData(null);
+                    setViewMode('FORM');
+                }
             };
 
             const handleScan = async (code) => {
@@ -817,8 +624,8 @@
                             <div className="flex-1">
                                 <h1 className="text-xl font-bold flex items-center gap-2">{isReadOnly && <Lock size={18} />} {listMeta?.name}</h1>
                                 <div className="text-blue-100 text-xs font-bold mt-1 flex gap-2 items-center">
-                                    <span>Total: {formatCurrency(calculateTotal())}</span>
                                     <span className={`status-dot bg-${status === 'online' ? 'online' : 'offline'}`}></span>
+                                    {status === 'online' ? 'Online' : 'Offline'}
                                 </div>
                             </div>
                             <div className="flex gap-2">
@@ -826,15 +633,10 @@
                                 {!isReadOnly && <button onClick={finalizeList} className="bg-white/20 px-3 py-1 rounded text-xs font-bold hover:bg-white/30">FINALIZAR</button>}
                             </div>
                         </div>
-                        {!isReadOnly && (
-                            <form onSubmit={handleAddItem} className="relative">
-                                <input type="text" value={newItem} onChange={e => setNewItem(e.target.value)} placeholder="Adicionar item..." className="w-full p-3 pr-12 rounded-full text-gray-800 shadow-inner outline-none" />
-                                <button type="submit" className="absolute right-2 top-1.5 bg-blue-500 p-1.5 rounded-full text-white"><Plus size={20} /></button>
-                            </form>
-                        )}
+                        {!isReadOnly && (<form onSubmit={handleAddItem} className="relative"><input type="text" value={newItem} onChange={e => setNewItem(e.target.value)} placeholder="Adicionar item..." className="w-full p-3 pr-12 rounded-full text-gray-800 shadow-inner outline-none" /><button type="submit" className="absolute right-2 top-1.5 bg-blue-500 p-1.5 rounded-full text-white"><Plus size={20} /></button></form>)}
                     </header>
 
-                    <main className="flex-1 overflow-y-auto p-4 space-y-3 ios-scroll pb-24">
+                    <main className="flex-1 overflow-y-auto p-4 space-y-3 ios-scroll pb-40">
                         {items.filter(i => i.status === 'pending').map(item => (
                             <div key={item.id} onClick={() => handleItemClick(item)} className={`bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center active:scale-[0.98] transition cursor-pointer ${isReadOnly ? 'opacity-50 pointer-events-none' : ''}`}>
                                 <span className="font-medium text-lg text-gray-800">{item.name}</span>
@@ -846,43 +648,22 @@
                                 <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">No Carrinho</h3>
                                 {items.filter(i => i.status === 'bought').map(item => (
                                     <div key={item.id} onClick={() => handleItemClick(item)} className="bg-green-50 p-3 rounded-lg border border-green-100 mb-2 flex justify-between items-center cursor-pointer active:scale-95">
-                                        <div className="flex-1">
-                                            <span className="font-bold text-gray-800 block">{item.name}</span>
-                                            <div className="text-xs text-gray-500 flex items-center gap-1">
-                                                <span className="bg-gray-200 px-1 rounded text-[10px] uppercase font-bold">{item.inputType === 'bulk' ? 'Kg' : 'Un'}</span>
-                                                <span>{item.inputType === 'bulk' ? `${item.volumeValue}${item.volumeUnit}` : `${item.quantity}x`}</span>
-                                                <span>{item.brand}</span>
-                                            </div>
-                                        </div>
-                                        <div className="text-right">
-                                            <span className="font-bold text-xl text-green-700 block">{formatCurrency(item.finalPrice || 0)}</span>
-                                            {item.boughtBy === DEVICE_ID ?
-                                                <span className="text-[10px] bg-blue-100 text-blue-700 px-1 rounded font-bold">VOCÊ</span>
-                                                :
-                                                <span className="text-[10px] bg-gray-200 text-gray-600 px-1 rounded font-bold">OUTRO</span>
-                                            }
-                                        </div>
+                                        <div className="flex-1"><span className="font-bold text-gray-800 block">{item.name}</span><div className="text-xs text-gray-500 flex items-center gap-1"><span className="bg-gray-200 px-1 rounded text-[10px] uppercase font-bold">{item.inputType === 'bulk' ? 'Kg' : 'Un'}</span><span>{item.inputType === 'bulk' ? `${item.volumeValue}${item.volumeUnit}` : `${item.quantity}x`}</span><span>{item.brand}</span></div></div>
+                                        <div className="text-right"><span className="font-bold text-xl text-green-700 block">{formatCurrency(item.finalPrice || 0)}</span>{item.boughtBy === DEVICE_ID ? <span className="text-[10px] bg-blue-100 text-blue-700 px-1 rounded font-bold">VOCÊ</span> : <span className="text-[10px] bg-gray-200 text-gray-600 px-1 rounded font-bold">OUTRO</span>}</div>
                                     </div>
                                 ))}
                             </div>
                         )}
                     </main>
 
-                    <footer className="bg-white border-t p-4 safe-area-pb flex flex-col gap-2">
-                        <div className="flex justify-between items-center">
-                            <span className="text-gray-500 font-bold uppercase text-xs">Total Geral</span>
-                            <span className="text-xl font-bold text-gray-800">{formatCurrency(calculateTotal())}</span>
-                        </div>
-                        <div className="flex justify-between items-center bg-blue-50 p-2 rounded-lg">
-                            <span className="text-blue-600 font-bold uppercase text-xs flex items-center gap-1"><User size={14} /> Meu Gasto</span>
-                            <span className="text-xl font-bold text-blue-700">{formatCurrency(calculateMyTotal())}</span>
-                        </div>
+                    <footer className="fixed bottom-0 left-0 right-0 bg-white border-t p-4 safe-area-pb flex flex-col gap-2 shadow-2xl z-50">
+                        <div className="flex justify-between items-center"><span className="text-gray-500 font-bold uppercase text-xs">Total Geral</span><span className="text-xl font-bold text-gray-800">{formatCurrency(calculateTotal())}</span></div>
+                        <div className="flex justify-between items-center bg-blue-50 p-2 rounded-lg"><span className="text-blue-600 font-bold uppercase text-xs flex items-center gap-1"><User size={14} /> Meu Gasto</span><span className="text-xl font-bold text-blue-700">{formatCurrency(calculateMyTotal())}</span></div>
                     </footer>
                 </div>
             );
         };
 
-        // --- DASHBOARD ---
         const Dashboard = ({ onSelect }) => {
             const [lists, setLists] = React.useState([]);
             const [name, setName] = React.useState('');
@@ -904,7 +685,7 @@
                 if (!name) return;
                 try {
                     const id = generateUUID();
-                    const list = { id, name, createdAt: new Date(), status: 'active', total: 0 };
+                    const list = { id, name, createdAt: new Date(), status: 'active', total: 0, updatedAt: new Date() };
                     await db.shoppingLists.add(list);
                     syncService.send('SYNC_LIST_UPDATE', list);
                     setName('');
@@ -927,9 +708,7 @@
                 let csv = "\uFEFFLista,Data,Item,Marca,Tipo,Volume,Qtd_Peso,Unitario,Total\n";
                 for (const item of allItems) {
                     const list = allLists.find(l => l.id === item.listId);
-                    if (list) {
-                        csv += `${list.name},${formatDate(list.createdAt)},${item.name},${item.brand || ''},${item.inputType || 'unit'},${item.volumeValue || ''}${item.volumeUnit || ''},${item.quantity},${item.unitPrice || 0},${item.finalPrice || 0}\n`;
-                    }
+                    if (list) { csv += `${list.name},${formatDate(list.createdAt)},${item.name},${item.brand || ''},${item.inputType || 'unit'},${item.volumeValue || ''}${item.volumeUnit || ''},${item.quantity},${item.unitPrice || 0},${item.finalPrice || 0}\n`; }
                 }
                 const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
                 const link = document.createElement("a");
@@ -940,39 +719,16 @@
             return (
                 <div className="flex flex-col h-full bg-gray-50">
                     <header className="bg-white p-6 border-b flex justify-between items-start">
-                        <div>
-                            <h1 className="text-2xl font-bold text-gray-800">Smart Shop</h1>
-                            <div className="flex items-center text-sm text-gray-500 mt-1">
-                                <span className={`status-dot bg-${status === 'online' ? 'online' : status === 'connecting' ? 'connecting' : 'offline'}`}></span>
-                                {status === 'online' ? 'Sincronizado' : 'Offline'}
-                            </div>
-                        </div>
+                        <div><h1 className="text-2xl font-bold text-gray-800">Smart Shop</h1><div className="flex items-center text-sm text-gray-500 mt-1"><span className={`status-dot bg-${status === 'online' ? 'online' : status === 'connecting' ? 'connecting' : 'offline'}`}></span>{status === 'online' ? 'Sincronizado' : 'Offline'}</div></div>
                         <button onClick={() => setShowMenu(!showMenu)} className="bg-gray-100 p-2 rounded-full text-gray-600"><Database size={20} /></button>
                     </header>
-                    {showMenu && (
-                        <div className="bg-gray-800 text-white p-4 animate-slide-up">
-                            <h3 className="font-bold mb-2 text-sm uppercase text-gray-400">Gestão Global</h3>
-                            <button onClick={exportGlobalData} className="w-full bg-white/10 p-3 rounded-lg flex items-center gap-2 text-sm hover:bg-white/20"><FileDown size={16} /> Exportar Tudo (CSV)</button>
-                        </div>
-                    )}
-                    <main className="flex-1 overflow-y-auto p-4 space-y-4">
-                        <form onSubmit={create} className="flex gap-2">
-                            <input value={name} onChange={e => setName(e.target.value)} placeholder="Nova Lista..." className="flex-1 p-3 rounded-lg border shadow-sm" />
-                            <button type="submit" className="bg-blue-600 text-white p-3 rounded-lg font-bold"><Plus /></button>
-                        </form>
+                    {showMenu && (<div className="bg-gray-800 text-white p-4 animate-slide-up"><h3 className="font-bold mb-2 text-sm uppercase text-gray-400">Gestão Global</h3><button onClick={exportGlobalData} className="w-full bg-white/10 p-3 rounded-lg flex items-center gap-2 text-sm hover:bg-white/20"><FileDown size={16} /> Exportar Tudo (CSV)</button></div>)}
+                    <main className="flex-1 overflow-y-auto p-4 space-y-4 pb-20">
+                        <form onSubmit={create} className="flex gap-2"><input value={name} onChange={e => setName(e.target.value)} placeholder="Nova Lista..." className="flex-1 p-3 rounded-lg border shadow-sm" /><button type="submit" className="bg-blue-600 text-white p-3 rounded-lg font-bold"><Plus /></button></form>
                         {lists.map(l => (
                             <div key={l.id} onClick={() => onSelect(l.id)} className={`bg-white p-4 rounded-xl shadow border-l-4 flex justify-between items-center cursor-pointer hover:bg-gray-50 ${l.status === 'active' ? 'border-blue-500' : 'border-gray-400 opacity-70'}`}>
-                                <div>
-                                    <span className="font-bold block text-lg">{l.name}</span>
-                                    <div className="flex items-center gap-2 text-xs text-gray-500">
-                                        <span>{formatDateTime(l.createdAt)}</span>
-                                        {l.status === 'completed' && <span className="bg-gray-200 px-1 rounded font-bold">FINALIZADA</span>}
-                                    </div>
-                                </div>
-                                <div className="flex items-center gap-3">
-                                    <span className="font-bold text-gray-700">{formatCurrency(l.total)}</span>
-                                    <button onClick={(e) => del(l.id, e)} className="text-red-400 p-2"><Trash2 size={18} /></button>
-                                </div>
+                                <div><span className="font-bold block text-lg">{l.name}</span><div className="flex items-center gap-2 text-xs text-gray-500"><span>{formatDateTime(l.createdAt)}</span>{l.status === 'completed' && <span className="bg-gray-200 px-1 rounded font-bold">FINALIZADA</span>}</div></div>
+                                <div className="flex items-center gap-3"><span className="font-bold text-gray-700">{formatCurrency(l.total)}</span><button onClick={(e) => del(l.id, e)} className="text-red-400 p-2"><Trash2 size={18} /></button></div>
                             </div>
                         ))}
                     </main>
@@ -981,13 +737,7 @@
             );
         };
 
-        const App = () => {
-            const [view, setView] = React.useState(null);
-            React.useEffect(() => { syncService.connect(); }, []);
-            if (view) return <ShoppingList listId={view} onBack={() => setView(null)} />;
-            return <Dashboard onSelect={setView} />;
-        };
-
+        const App = () => { const [view, setView] = React.useState(null); React.useEffect(() => { syncService.connect(); }, []); if (view) return <ShoppingList listId={view} onBack={() => setView(null)} />; return <Dashboard onSelect={setView} />; };
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<App />);
     </script>
