@@ -99,11 +99,11 @@
         const formatDate = (date) => new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(safeDate(date));
         const formatCurrency = (val) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(val || 0);
 
-        // --- BANCO DE DADOS (Versão 6 - Migração para UUID) ---
-        const db = new Dexie('SmartShopDB');
-        db.version(6).stores({
-            shoppingLists: 'id, name, createdAt, status', // id agora é UUID (string)
-            items: 'id, listId, name, status',
+        // --- BANCO DE DADOS (NOVO NOME PARA LIMPAR CONFLITOS DE VERSÃO) ---
+        const db = new Dexie('SmartShopSyncDB'); // Mudamos o nome para garantir schema limpo
+        db.version(1).stores({
+            shoppingLists: 'id, name, createdAt, status', // id = UUID string
+            items: 'id, listId, name, status', // id = UUID string
             products: 'barcode, brand, description, volumeValue, volumeUnit, lastPrice, lastDate, inputType',
             cartLog: '++id, date, listId, barcode, brand, description, price, name'
         });
@@ -323,12 +323,17 @@
             const addItem = async (e) => {
                 e.preventDefault();
                 if (!newItem.trim()) return;
-                // USE UUID AQUI
-                const item = { id: generateUUID(), listId, name: newItem, status: 'pending', unitPrice: 0, finalPrice: 0, quantity: 1 };
-                await db.items.add(item);
-                syncService.send('SYNC_ITEM_UPDATE', item);
-                setNewItem('');
-                loadData();
+                try {
+                    // USE UUID AQUI
+                    const item = { id: generateUUID(), listId, name: newItem, status: 'pending', unitPrice: 0, finalPrice: 0, quantity: 1 };
+                    await db.items.add(item);
+                    syncService.send('SYNC_ITEM_UPDATE', item);
+                    setNewItem('');
+                    loadData();
+                } catch (err) {
+                    alert("Erro ao adicionar item: " + err.message);
+                    console.error(err);
+                }
             };
 
             const toggleItem = async (item) => {
@@ -391,14 +396,20 @@
             const create = async (e) => {
                 e.preventDefault();
                 if (!name) return;
-                // USE UUID AQUI
-                const id = generateUUID();
-                const list = { id, name, createdAt: new Date(), status: 'active', total: 0 };
 
-                await db.shoppingLists.add(list);
-                syncService.send('SYNC_LIST_UPDATE', list);
-                setName('');
-                onSelect(id);
+                try {
+                    // USE UUID AQUI
+                    const id = generateUUID();
+                    const list = { id, name, createdAt: new Date(), status: 'active', total: 0 };
+
+                    await db.shoppingLists.add(list);
+                    syncService.send('SYNC_LIST_UPDATE', list);
+                    setName('');
+                    onSelect(id);
+                } catch (err) {
+                    console.error(err);
+                    alert("Erro ao criar lista: " + err.message + "\n\nTente recarregar a página.");
+                }
             };
 
             const del = async (id, e) => {
