@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Smart Shop Sync Pro</title>
+
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/dexie/dist/dexie.js"></script>
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+
+    <style>
+        body {
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+        }
+
+        .ios-scroll {
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .animate-fade-in {
+            animation: fadeIn 0.3s ease-out forwards;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+
+            to {
+                opacity: 1;
+            }
+        }
+
+        /* Status Indicators */
+        .status-dot {
+            height: 8px;
+            width: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 6px;
+        }
+
+        .bg-online {
+            background-color: #22c55e;
+            box-shadow: 0 0 8px #22c55e;
+        }
+
+        .bg-offline {
+            background-color: #ef4444;
+        }
+
+        .bg-connecting {
+            background-color: #eab308;
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+
+            100% {
+                opacity: 1;
+            }
+        }
+    </style>
+</head>
+
+<body class="bg-gray-100 text-gray-800 font-sans h-screen overflow-hidden">
+
+    <div id="root" class="h-full w-full flex flex-col"></div>
+
+    <script type="text/babel">
+        // --- UTILITÁRIOS ---
+        const generateUUID = () => {
+            if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        };
+
+        const safeDate = (dateInput) => {
+            if (!dateInput) return new Date();
+            const d = new Date(dateInput);
+            return isNaN(d.getTime()) ? new Date() : d;
+        };
+
+        const formatDate = (date) => new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(safeDate(date));
+        const formatCurrency = (val) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(val || 0);
+
+        // --- BANCO DE DADOS (NOVO NOME PARA LIMPAR CONFLITOS DE VERSÃO) ---
+        const db = new Dexie('SmartShopSyncDB'); // Mudamos o nome para garantir schema limpo
+        db.version(1).stores({
+            shoppingLists: 'id, name, createdAt, status', // id = UUID string
+            items: 'id, listId, name, status', // id = UUID string
+            products: 'barcode, brand, description, volumeValue, volumeUnit, lastPrice, lastDate, inputType',
+            cartLog: '++id, date, listId, barcode, brand, description, price, name'
+        });
+
+        // --- DEBUG LOGGER ---
+        const debugLog = {
+            listeners: [],
+            add(msg, type = 'info') {
+                const entry = { id: Date.now() + Math.random(), time: new Date().toLocaleTimeString(), msg, type };
+                console.log(`[${type.toUpperCase()}] ${msg}`);
+                this.listeners.forEach(l => l(entry));
+            },
+            subscribe(cb) { this.listeners.push(cb); return () => this.listeners = this.listeners.filter(l => l !== cb); }
+        };
+
+        // --- SERVIÇO DE SINCRONIZAÇÃO INTELIGENTE ---
+        class SyncService {
+            constructor() {
+                this.socket = null;
+                this.status = 'offline';
+                this.statusListeners = [];
+                this.reconnectTimer = null;
+
+                // ============================================================
+                // SEU SERVIDOR AQUI
+                // ============================================================
+                this.url = 'wss://smart-shop-server-o9ab.onrender.com';
+            }
+
+            connect() {
+                if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) return;
+
+                this.updateStatus('connecting');
+                debugLog.add(`Conectando...`, 'network');
+
+                try {
+                    this.socket = new WebSocket(this.url);
+
+                    this.socket.onopen = () => {
+                        this.updateStatus('online');
+                        debugLog.add('Online! Solicitando dados...', 'success');
+                        // HANDSHAKE: Assim que conecta, pede tudo que os outros têm
+                        this.send('REQUEST_FULL_SYNC', {});
+                    };
+
+                    this.socket.onclose = () => {
+                        this.updateStatus('offline');
+                        this.socket = null;
+                        clearTimeout(this.reconnectTimer);
+                        this.reconnectTimer = setTimeout(() => this.connect(), 5000);
+                    };
+
+                    this.socket.onmessage = async (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'PING') return;
+
+                            debugLog.add(`Rx: ${data.type}`, 'network');
+                            await this.handleIncomingData(data);
+                        } catch (e) {
+                            console.error(e);
+                        }
+                    };
+
+                } catch (e) {
+                    this.updateStatus('offline');
+                }
+            }
+
+            send(type, payload) {
+                if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+                    this.socket.send(JSON.stringify({ type, payload }));
+                }
+            }
+
+            async handleIncomingData(data) {
+                // 1. Alguém pediu dados? Vamos enviar tudo o que temos!
+                if (data.type === 'REQUEST_FULL_SYNC') {
+                    const allLists = await db.shoppingLists.toArray();
+                    const allItems = await db.items.toArray();
+                    // Envia de volta para quem pediu (broadcast vai pra todos, mas ok)
+                    if (allLists.length > 0 || allItems.length > 0) {
+                        debugLog.add(`Enviando Sincronização Completa (${allLists.length} listas)`, 'info');
+                        this.send('FULL_SYNC_RESPONSE', { lists: allLists, items: allItems });
+                    }
+                }
+
+                // 2. Recebemos um pacotão de dados? Vamos salvar!
+                else if (data.type === 'FULL_SYNC_RESPONSE') {
+                    const { lists, items } = data.payload;
+
+                    // Tratamento de Datas (String -> Date)
+                    const cleanLists = lists.map(l => ({ ...l, createdAt: safeDate(l.createdAt) }));
+
+                    // BulkPut é inteligente: só atualiza se mudou ou adiciona se novo
+                    if (cleanLists.length) await db.shoppingLists.bulkPut(cleanLists);
+                    if (items.length) await db.items.bulkPut(items);
+
+                    debugLog.add(`Base atualizada: ${cleanLists.length} Listas`, 'success');
+                    window.dispatchEvent(new Event('external-data-change'));
+                }
+
+                // 3. Atualizações pontuais (Tempo real)
+                else if (data.type === 'SYNC_ITEM_UPDATE') {
+                    await db.items.put(data.payload);
+                    window.dispatchEvent(new Event('external-data-change'));
+                }
+                else if (data.type === 'SYNC_LIST_UPDATE') {
+                    const list = { ...data.payload, createdAt: safeDate(data.payload.createdAt) };
+                    await db.shoppingLists.put(list);
+                    window.dispatchEvent(new Event('external-data-change'));
+                }
+                else if (data.type === 'SYNC_LIST_DELETE') {
+                    await db.shoppingLists.delete(data.payload.id);
+                    await db.items.where('listId').equals(data.payload.id).delete();
+                    window.dispatchEvent(new Event('external-data-change'));
+                }
+            }
+
+            subscribeStatus(cb) {
+                this.statusListeners.push(cb);
+                cb(this.status);
+                return () => this.statusListeners = this.statusListeners.filter(l => l !== cb);
+            }
+
+            updateStatus(s) {
+                this.status = s;
+                this.statusListeners.forEach(cb => cb(s));
+            }
+        }
+
+        const syncService = new SyncService();
+
+        // --- COMPONENTES VISUAIS ---
+
+        const Icon = ({ path, size = 24, className }) => (
+            <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} dangerouslySetInnerHTML={{ __html: path }} />
+        );
+        const Icons = {
+            Bug: '<rect width="8" height="14" x="8" y="6" rx="4"/><path d="m19 7-3 2"/><path d="m5 7 3 2"/><path d="m19 19-3-2"/><path d="m5 19 3-2"/><path d="M20 13h-4"/><path d="M4 13h4"/><path d="m10 4 1 2"/>',
+            ArrowLeft: '<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>',
+            Plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+            Trash: '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
+            Refresh: '<path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/>'
+        };
+
+        // --- PAINEL DE DEBUG ---
+        const DebugConsole = () => {
+            const [logs, setLogs] = React.useState([]);
+            const [isOpen, setIsOpen] = React.useState(false);
+            const messagesEndRef = React.useRef(null);
+
+            React.useEffect(() => {
+                return debugLog.subscribe(entry => {
+                    setLogs(prev => [...prev.slice(-19), entry]);
+                });
+            }, []);
+
+            React.useEffect(() => {
+                if (isOpen && messagesEndRef.current) messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
+            }, [logs, isOpen]);
+
+            if (!isOpen) return (
+                <button onClick={() => setIsOpen(true)} className="fixed bottom-4 right-4 bg-gray-800 text-white p-3 rounded-full shadow-lg z-[100] opacity-50 hover:opacity-100">
+                    <Icon path={Icons.Bug} size={20} />
+                </button>
+            );
+
+            return (
+                <div className="fixed bottom-0 left-0 right-0 h-48 bg-gray-900 text-green-400 font-mono text-xs z-[100] flex flex-col shadow-2xl border-t border-gray-700">
+                    <div className="flex justify-between items-center p-2 bg-gray-800 border-b border-gray-700">
+                        <span className="font-bold text-gray-300">Rede & Sync</span>
+                        <div className="flex gap-2">
+                            <button onClick={() => syncService.send('REQUEST_FULL_SYNC', {})} className="bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-500 text-[10px] flex items-center gap-1">
+                                <Icon path={Icons.Refresh} size={10} /> Forçar Sync
+                            </button>
+                            <button onClick={() => setIsOpen(false)} className="text-gray-400 hover:text-white px-2">X</button>
+                        </div>
+                    </div>
+                    <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                        {logs.map((l) => (
+                            <div key={l.id} className={l.type === 'error' ? 'text-red-400' : l.type === 'network' ? 'text-blue-300' : 'text-green-400'}>
+                                <span className="opacity-50">[{l.time}]</span> {l.msg}
+                            </div>
+                        ))}
+                        <div ref={messagesEndRef} />
+                    </div>
+                </div>
+            );
+        };
+
+        // --- COMPONENTE: LISTA DE COMPRAS ---
+        const ShoppingList = ({ listId, onBack }) => {
+            const [items, setItems] = React.useState([]);
+            const [newItem, setNewItem] = React.useState('');
+            const [listName, setListName] = React.useState('');
+            const [status, setStatus] = React.useState('offline');
+
+            React.useEffect(() => {
+                loadData();
+                const unsub = syncService.subscribeStatus(setStatus);
+                const handleExternal = () => loadData(); // Simples reload
+                window.addEventListener('external-data-change', handleExternal);
+                return () => {
+                    unsub();
+                    window.removeEventListener('external-data-change', handleExternal);
+                };
+            }, [listId]);
+
+            const loadData = async () => {
+                const l = await db.shoppingLists.get(listId);
+                const i = await db.items.where('listId').equals(listId).toArray();
+                setListName(l?.name || 'Lista (Sincronizando...)');
+                setItems(i);
+            };
+
+            const addItem = async (e) => {
+                e.preventDefault();
+                if (!newItem.trim()) return;
+                try {
+                    // USE UUID AQUI
+                    const item = { id: generateUUID(), listId, name: newItem, status: 'pending', unitPrice: 0, finalPrice: 0, quantity: 1 };
+                    await db.items.add(item);
+                    syncService.send('SYNC_ITEM_UPDATE', item);
+                    setNewItem('');
+                    loadData();
+                } catch (err) {
+                    alert("Erro ao adicionar item: " + err.message);
+                    console.error(err);
+                }
+            };
+
+            const toggleItem = async (item) => {
+                const newStatus = item.status === 'pending' ? 'bought' : 'pending';
+                const updated = { ...item, status: newStatus };
+                await db.items.put(updated);
+                syncService.send('SYNC_ITEM_UPDATE', updated);
+                loadData();
+            };
+
+            return (
+                <div className="flex flex-col h-full bg-gray-50">
+                    <header className="bg-blue-600 text-white p-4 shadow flex items-center gap-4">
+                        <button onClick={onBack}><Icon path={Icons.ArrowLeft} /></button>
+                        <div className="flex-1">
+                            <h1 className="font-bold text-lg truncate">{listName}</h1>
+                            <div className="flex items-center text-xs opacity-90">
+                                <span className={`status-dot bg-${status}`}></span>
+                                {status === 'online' ? 'Sincronizado' : status === 'connecting' ? 'Conectando...' : 'Offline'}
+                            </div>
+                        </div>
+                    </header>
+
+                    <main className="flex-1 overflow-y-auto p-4 space-y-2">
+                        <form onSubmit={addItem} className="flex gap-2 mb-4">
+                            <input value={newItem} onChange={e => setNewItem(e.target.value)} placeholder="Novo item..." className="flex-1 p-3 rounded-lg shadow-sm border-none outline-none" />
+                            <button type="submit" className="bg-blue-500 text-white p-3 rounded-lg shadow"><Icon path={Icons.Plus} /></button>
+                        </form>
+
+                        {items.length === 0 && <p className="text-center text-gray-400 mt-10">Lista vazia.</p>}
+
+                        {items.map(item => (
+                            <div key={item.id} onClick={() => toggleItem(item)} className={`p-4 bg-white rounded-lg shadow-sm flex justify-between items-center transition-all active:scale-95 cursor-pointer ${item.status === 'bought' ? 'opacity-50 bg-gray-100' : ''}`}>
+                                <span className={item.status === 'bought' ? 'line-through' : 'font-bold'}>{item.name}</span>
+                                {item.status === 'bought' && <span className="text-green-600 font-bold text-sm">✓</span>}
+                            </div>
+                        ))}
+                    </main>
+                    <DebugConsole />
+                </div>
+            );
+        };
+
+        // --- COMPONENTE: DASHBOARD ---
+        const Dashboard = ({ onSelect }) => {
+            const [lists, setLists] = React.useState([]);
+            const [name, setName] = React.useState('');
+            const [status, setStatus] = React.useState('offline');
+
+            React.useEffect(() => {
+                loadLists();
+                const unsub = syncService.subscribeStatus(setStatus);
+                const handleExternal = () => loadLists();
+                window.addEventListener('external-data-change', handleExternal);
+                return () => { unsub(); window.removeEventListener('external-data-change', handleExternal); };
+            }, []);
+
+            const loadLists = async () => setLists(await db.shoppingLists.toArray());
+
+            const create = async (e) => {
+                e.preventDefault();
+                if (!name) return;
+
+                try {
+                    // USE UUID AQUI
+                    const id = generateUUID();
+                    const list = { id, name, createdAt: new Date(), status: 'active', total: 0 };
+
+                    await db.shoppingLists.add(list);
+                    syncService.send('SYNC_LIST_UPDATE', list);
+                    setName('');
+                    onSelect(id);
+                } catch (err) {
+                    console.error(err);
+                    alert("Erro ao criar lista: " + err.message + "\n\nTente recarregar a página.");
+                }
+            };
+
+            const del = async (id, e) => {
+                e.stopPropagation();
+                if (!confirm('Apagar lista?')) return;
+
+                await db.shoppingLists.delete(id);
+                await db.items.where('listId').equals(id).delete();
+                syncService.send('SYNC_LIST_DELETE', { id });
+
+                loadLists();
+            };
+
+            return (
+                <div className="flex flex-col h-full bg-gray-50">
+                    <header className="bg-white p-6 border-b flex justify-between items-center">
+                        <div>
+                            <h1 className="text-2xl font-bold text-gray-800">Smart Shop</h1>
+                            <div className="flex items-center text-sm text-gray-500 mt-1">
+                                <span className={`status-dot bg-${status}`}></span>
+                                {status === 'online' ? 'Online' : status === 'connecting' ? 'Conectando...' : 'Offline'}
+                            </div>
+                        </div>
+                    </header>
+                    <main className="flex-1 overflow-y-auto p-4 space-y-4">
+                        <form onSubmit={create} className="flex gap-2">
+                            <input value={name} onChange={e => setName(e.target.value)} placeholder="Nova Lista..." className="flex-1 p-3 rounded-lg border shadow-sm" />
+                            <button type="submit" className="bg-blue-600 text-white p-3 rounded-lg font-bold">Criar</button>
+                        </form>
+                        {lists.map(l => (
+                            <div key={l.id} onClick={() => onSelect(l.id)} className="bg-white p-4 rounded-xl shadow border-l-4 border-blue-500 flex justify-between items-center cursor-pointer hover:bg-gray-50">
+                                <div>
+                                    <span className="font-bold block">{l.name}</span>
+                                    <span className="text-xs text-gray-400">{formatDate(l.createdAt)}</span>
+                                </div>
+                                <button onClick={(e) => del(l.id, e)} className="text-red-400 p-2"><Icon path={Icons.Trash} size={18} /></button>
+                            </div>
+                        ))}
+                    </main>
+                    <DebugConsole />
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [view, setView] = React.useState(null);
+
+            React.useEffect(() => {
+                syncService.connect();
+            }, []);
+
+            if (view) return <ShoppingList listId={view} onBack={() => setView(null)} />;
+            return <Dashboard onSelect={setView} />;
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>
